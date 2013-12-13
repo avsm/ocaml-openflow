@@ -14,11 +14,29 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *)
 
-exception ReadError
-type t
+(** OpenFlow socket structure *)
+type conn_type 
+type conn_state = {
+  mutable dpid : Ofpacket.datapath_id;
+  t : conn_type; 
+}
 
-(* open Openflow_net_lwt *)
-open Net 
+(** Socket initialization *)
 
-val create_socket: Channel.t -> t
-val read_data: t -> int -> Cstruct.buf Lwt.t
+(** initialize an OpenFlow socket from a Net.Channel.t socket*)
+val init_socket_conn_state : Net.Channel.t -> conn_state
+(** create an emulated local socket using Lwt_stream structures *)
+val init_local_conn_state: unit -> (conn_state * conn_state)
+
+(** Socket access methods *)
+
+(** [read_packet conn] read a complete and parsed OpenFlow packet from the
+ * control channel socket *)
+val read_packet : conn_state -> Ofpacket.t Lwt.t
+(** [send_packet conn pkt] send an complete OpenFlow packet over the control
+ * channel socket *)
+val send_packet : conn_state -> Ofpacket.t -> unit Lwt.t
+(** [send_data_raw conn bits] send raw bits over the control channel socket *)
+val send_data_raw : conn_state -> Cstruct.t -> unit Lwt.t
+(** [conn conn] teardown the control channel socket *)
+val close : conn_state -> unit 

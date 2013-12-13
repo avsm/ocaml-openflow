@@ -4,45 +4,58 @@ all: build
 NAME=openflow
 J=4
 
-LWT ?= $(shell if ocamlfind query lwt.ssl >/dev/null 2>&1; then echo --enable-lwt; fi)
-MIRAGE ?= $(shell if ocamlfind query mirage-net >/dev/null 2>&1; then echo --enable-mirage; fi)
-ifeq ($(MIRAGE_OS),xen)
-XEN ?= --enable-xen
-endif
+UNIX ?= $(shell if [ $(MIRAGE_OS) = "unix" ]; then echo --enable-unix; else echo --disable-unix; fi)
+DIRECT ?= $(shell if [ $(MIRAGE_NET) = "direct" ]; then echo --enable-direct; else echo --disable-direct; fi)
+XEN ?= $(shell if [ $(MIRAGE_OS) = "xen" ]; then echo --enable-xen; else echo --disable-xen; fi)
+caml_path ?= $(shell ocamlfind printconf path)
+
+# MIRAGE = --enable-mirage
 
 -include Makefile.config
 
-clean: setup.data
-	./setup.bin -clean $(OFLAGS)
-	rm -f setup.data setup.log setup.bin
+setup.ml: _oasis
+	oasis setup 
 
-distclean: setup.data
-	./setup.bin -distclean $(OFLAGS)
-	rm -f setup.data setup.log setup.bin
+setup.data: setup.ml
+	ocaml setup.ml -configure $(UNIX) $(XEN) $(DIRECT)
+
+clean: setup.data 
+	ocaml setup.ml -clean $(OFLAGS)
+	rm -f setup.data setup.log setup.ml
+
+distclean: setup.ml setup.data
+	ocaml setup.ml -distclean $(OFLAGS)
+	rm -f setup.data setup.log setup.ml
 
 setup: setup.data
 
 build: setup.data $(wildcard lib/*.ml)
-	./setup.bin -build -j $(J) $(OFLAGS)
+	ocaml setup.ml -build -cflags -bin-annot -j $(J) $(OFLAGS) $(DR)
+ifeq ($(MIRAGE_OS), xen)
+	ld -d -nostdlib -m elf_x86_64 -T $(caml_path)/mirage-xen/mirage-x86_64.lds \
+	  $(caml_path)/mirage-xen/x86_64.o _build/switch/xen_switch.nobj.o \
+	  $(caml_path)/mirage-xen/libocaml.a   $(caml_path)/mirage-xen/libxen.a \
+	  $(caml_path)/mirage-xen/libxencaml.a $(caml_path)/mirage-xen/libdiet.a \
+	  $(caml_path)/mirage-xen/libm.a       $(caml_path)/mirage-xen/longjmp.o \
+	  -o ofswitch.xen
 
-doc: setup.data setup.bin
-	./setup.bin -doc -j $(J) $(OFLAGS)
+	ld -d -nostdlib -m elf_x86_64 -T $(caml_path)/mirage-xen/mirage-x86_64.lds \
+	  $(caml_path)/mirage-xen/x86_64.o _build/controller/xen_controller.nobj.o \
+	  $(caml_path)/mirage-xen/libocaml.a   $(caml_path)/mirage-xen/libxen.a \
+	  $(caml_path)/mirage-xen/libxencaml.a $(caml_path)/mirage-xen/libdiet.a \
+	  $(caml_path)/mirage-xen/libm.a       $(caml_path)/mirage-xen/longjmp.o \
+	  -o ofcontroller.xen
+
+endif 
+
+doc: setup.data setup.ml
+	ocaml setup.ml -doc -j $(J) $(OFLAGS)
 
 install: 
 	ocamlfind remove $(NAME)
-	./setup.bin -install $(OFLAGS)
+	ocaml setup.ml -install $(OFLAGS)
 
 test: build
-	./setup.bin -test
+	ocaml setup.ml -test
 
-##
 
-setup.bin: setup.ml
-	ocamlopt.opt -o $@ $< || ocamlopt -o $@ $< || ocamlc -o $@ $<
-	rm -f setup.cmx setup.cmi setup.o setup.cmo
-
-setup.ml: _oasis
-	oasis setup
-
-setup.data: setup.bin
-	./setup.bin -configure $(LWT) $(MIRAGE) $(XEN) --enable-tests

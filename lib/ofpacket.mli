@@ -15,18 +15,16 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  *)
 
-exception Unparsable of string * Cstruct.buf
-exception Unparsed of string * Cstruct.buf
+exception Unparsable of string * Cstruct.t
+exception Unparsed of string * Cstruct.t
 
 type int16 = int
 type uint8 = char
 type uint16 = int
 type uint32 = int32
 type uint64 = int64
-type ipv4 = uint32
 type byte = uint8
 type bytes = string
-type eaddr = bytes
 type vendor = uint32
 type queue_id = uint32
 type datapath_id = uint64
@@ -38,7 +36,7 @@ module Header :
       | ERROR
       | ECHO_REQ
       | ECHO_RESP
-      | VENDOR
+      | VENDOR_MSG
       | FEATURES_REQ
       | FEATURES_RESP
       | GET_CONFIG_REQ
@@ -56,11 +54,12 @@ module Header :
       | BARRIER_RESP
       | QUEUE_GET_CONFIG_REQ
       | QUEUE_GET_CONFIG_RESP
-    type h = { ver : uint8; ty : msg_code; len : uint16; xid : uint32; }
-    val parse_header : Cstruct.buf -> h
+    type h = {ver:uint8;ty:msg_code;len:uint16;xid:uint32;}
+    val get_len : int
+    val parse_header : Cstruct.t -> h
     val header_to_string : h -> string
-    val create : msg_code -> uint16 -> uint32 -> h
-    val marshal_header : h -> Cstruct.buf -> int
+    val create : ?xid:uint32 -> msg_code -> uint16 -> h
+    val marshal_header : h -> Cstruct.t -> int
     val sizeof_ofp_header : int 
   end
 module Queue :
@@ -84,6 +83,7 @@ module Port :
     val port_of_int : int16 -> t
     val int_of_port : t -> int16
     val string_of_port : t -> string
+    val port_of_string : string -> t option 
     type config = {
       port_down : bool;
       no_stp : bool;
@@ -116,7 +116,7 @@ module Port :
     }
     type phy = {
       port_no : uint16;
-      hw_addr : eaddr;
+      hw_addr : Macaddr.t;
       name : string;
       config : config;
       state : state;
@@ -125,8 +125,9 @@ module Port :
       supported : features;
       peer : features;
     }
-    val init_port_phy: ?port_no:int -> ?hw_addr:eaddr -> 
-      ?name:string -> unit -> phy 
+    val init_port_phy: ?port_no:int -> ?hw_addr:Macaddr.t -> 
+      ?name:string -> unit -> phy
+      val translate_port_phy : phy -> int -> phy
     val string_of_phy : phy -> string
     type stats = {
       mutable port_id : uint16;
@@ -147,7 +148,9 @@ module Port :
     type reason = ADD | DEL | MOD
     val reason_to_string: reason -> string
     type status = { reason : reason; desc : phy; }
+    val create_port_status : reason -> phy -> Header.h * status
     val string_of_status : status -> string
+    val marshal_port_status : ?xid:int32 -> status -> Cstruct.t -> int
   end
 module Switch :
   sig
@@ -183,65 +186,80 @@ module Switch :
       actions : actions;
       mutable ports : Port.phy list;
     }
-    val marshal_reply_features : int32 -> features -> Cstruct.buf -> int
+    val marshal_reply_features : int32 -> features -> Cstruct.t -> int
+    val get_len : features -> int 
     type config = { drop : bool; reasm : bool; miss_send_len : uint16; }
     val init_switch_config : config
-    val marshal_switch_config : int32 -> config -> Cstruct.buf -> int 
+    val config_get_len : int
+    val marshal_switch_config : int32 -> config -> Cstruct.t -> int 
   end
 module Wildcards :
   sig
     type t = {
-      in_port : bool;
-      dl_vlan : bool;
-      dl_src : bool;
-      dl_dst : bool;
-      dl_type : bool;
-      nw_proto : bool;
-      tp_src : bool;
-      tp_dst : bool;
-      nw_src : byte;
-      nw_dst : byte;
-      dl_vlan_pcp : bool;
-      nw_tos : bool;
+      mutable in_port : bool;
+      mutable dl_vlan : bool;
+      mutable dl_src : bool;
+      mutable dl_dst : bool;
+      mutable dl_type : bool;
+      mutable nw_proto : bool;
+      mutable tp_src : bool;
+      mutable tp_dst : bool;
+      mutable nw_src : byte;
+      mutable nw_dst : byte;
+      mutable dl_vlan_pcp : bool;
+      mutable nw_tos : bool;
     }
-    val full_wildcard : t
-    val exact_match : t
-    val l2_match : t
-    val l3_match : t
-    val arp_match : t
+    val in_port_match : unit -> t
+    val full_wildcard : unit ->  t
+    val exact_match : unit ->  t
+    val l2_match : unit ->  t
+    val l3_match : unit ->  t
+    val arp_match : unit ->  t
     val wildcard_to_string : t -> string
   end
 module Match :
   sig
     type t = {
-      wildcards : Wildcards.t;
-      in_port : Port.t;
-      dl_src : eaddr;
-      dl_dst : eaddr;
-      dl_vlan : uint16;
-      dl_vlan_pcp : byte;
-      dl_type : uint16;
-      nw_src : uint32;
-      nw_dst : uint32;
-      nw_tos : byte;
-      nw_proto : byte;
-      tp_src : uint16;
-      tp_dst : uint16;
+      mutable wildcards : Wildcards.t;
+      mutable in_port : Port.t;
+      mutable dl_src : Macaddr.t;
+      mutable dl_dst : Macaddr.t;
+      mutable dl_vlan : uint16;
+      mutable dl_vlan_pcp : byte;
+      mutable dl_type : uint16;
+      mutable nw_src : Ipaddr.V4.t;
+      mutable nw_dst : Ipaddr.V4.t;
+      mutable nw_tos : byte;
+      mutable nw_proto : byte;
+      mutable tp_src : uint16;
+      mutable tp_dst : uint16;
     }
-    val flow_match_compare : t -> t -> Wildcards.t -> bool
+
+    val wildcard: unit -> t
+    val create_match : ?in_port:int option -> ?dl_vlan:int option -> 
+      ?dl_src:(* Net.Nettypes.ethernet_mac *) Macaddr.t option -> 
+      ?dl_dst:(* Net.Nettypes.ethernet_mac *) Macaddr.t option ->
+      ?dl_type:int option -> ?nw_proto:char option ->
+      ?tp_dst:int option -> ?tp_src:int option ->
+      ?nw_dst:Ipaddr.V4.t option -> ?nw_dst_len:int ->
+      ?nw_src:Ipaddr.V4.t option -> ?nw_src_len:int ->
+      ?dl_vlan_pcp:char option -> ?nw_tos:char option -> unit -> t
+
+   val flow_match_compare : t -> t -> Wildcards.t -> bool
     val create_flow_match :
       Wildcards.t ->
       ?in_port:int16 ->
-      ?dl_src:eaddr ->
-      ?dl_dst:eaddr ->
+      ?dl_src:Macaddr.t ->
+      ?dl_dst:Macaddr.t ->
       ?dl_vlan:uint16 ->
       ?dl_vlan_pcp:byte ->
       ?dl_type:uint16 ->
       ?nw_tos:byte ->
       ?nw_proto:byte ->
-      ?nw_src:uint32 ->
-      ?nw_dst:uint32 -> ?tp_src:uint16 -> ?tp_dst:uint16 -> unit -> t
-    val raw_packet_to_match : Port.t -> Cstruct.buf -> t
+      ?nw_src:Ipaddr.V4.t ->
+      ?nw_dst:Ipaddr.V4.t -> ?tp_src:uint16 -> ?tp_dst:uint16 -> unit -> t
+    val translate_port : t -> Port.t -> t
+    val raw_packet_to_match : Port.t -> Cstruct.t -> t
     val match_to_string : t -> string
   end
 module Flow :
@@ -251,10 +269,10 @@ module Flow :
     | Set_vlan_vid of int 
     | Set_vlan_pcp of int 
     | STRIP_VLAN 
-    | Set_dl_src of eaddr
-    | Set_dl_dst of eaddr
-    | Set_nw_src of ipv4 
-    | Set_nw_dst of ipv4
+    | Set_dl_src of Macaddr.t
+    | Set_dl_dst of Macaddr.t
+    | Set_nw_src of Ipaddr.V4.t 
+    | Set_nw_dst of Ipaddr.V4.t
     | Set_nw_tos of byte 
     | Set_tp_src of int16 
     | Set_tp_dst of int16
@@ -264,11 +282,12 @@ module Flow :
     val int_of_action : action -> int
     val string_of_action : action -> string
     val string_of_actions : action list -> string
-    val marshal_action : action -> Cstruct.buf -> int
-    type reason = IDLE_TIMEOUT | HARD_TIMEOUT | DELETE
-    val reason_of_int : int -> reason
-    val int_of_reason : reason -> int
-    val string_of_reason : reason -> int
+    val marshal_action : action -> Cstruct.t -> int
+    cenum reason {
+      IDLE_TIMEOUT = 0;
+      HARD_TIMEOUT = 1;
+      DELETE = 2
+    } as uint8_t 
     type stats = {
       mutable table_id : byte;
       mutable of_match : Match.t;
@@ -282,8 +301,9 @@ module Flow :
       mutable byte_count : uint64;
       mutable action : action list;
     }
-    val marshal_flow_stats : stats list -> Cstruct.buf -> int 
+    val marshal_flow_stats : stats list -> Cstruct.t -> int 
     val string_of_flow_stat : stats -> string
+    val flow_stats_len : stats -> int 
   end
 module Packet_in :
   sig
@@ -295,13 +315,13 @@ module Packet_in :
       buffer_id : uint32;
       in_port : Port.t;
       reason : reason;
-      data : Cstruct.buf;
+      data : Cstruct.t;
     }
     val packet_in_to_string : t -> string
     val create_pkt_in : ?buffer_id:uint32 -> in_port:Port.t -> 
-      reason:reason -> data:Cstruct.buf -> t 
+      reason:reason -> data:Cstruct.t -> (Header.h * t)
     val marshal_pkt_in : ?xid:int32 -> ?data_len:int -> t -> 
-      Cstruct.buf -> int
+      Cstruct.t -> int
   end
 module Packet_out :
   sig
@@ -309,15 +329,15 @@ module Packet_out :
       buffer_id : uint32;
       in_port : Port.t;
       actions : Flow.action list;
-      data : Cstruct.buf;
+      data : Cstruct.t;
     }
     val create :
       ?xid:uint32 ->
       ?buffer_id:uint32 ->
       ?actions:Flow.action list ->
-      data:Cstruct.buf -> in_port:Port.t -> 
+      data:Cstruct.t -> in_port:Port.t -> 
         unit -> t
-    val marshal_packet_out : t -> Cstruct.buf -> int
+    val marshal_packet_out : ?xid:int32 -> t -> Cstruct.t -> int
     val packet_out_to_string: t -> string
   end
 module Flow_mod :
@@ -328,16 +348,16 @@ module Flow_mod :
     val string_of_command : command -> string
     type flags = { send_flow_rem : bool; emerg : bool; overlap : bool; }
     type t = {
-      of_match : Match.t;
+      mutable of_match : Match.t;
       cookie : uint64;
       command : command;
-      idle_timeout : uint16;
-      hard_timeout : uint16;
-      priority : uint16;
+      mutable idle_timeout : uint16;
+      mutable hard_timeout : uint16;
+      mutable priority : uint16;
       buffer_id : int32;
       out_port : Port.t;
       flags : flags;
-      actions : Flow.action list; (* array; *)
+      mutable actions : Flow.action list; (* array; *)
     }
     val flow_mod_to_string: t -> string
     val create :
@@ -347,7 +367,7 @@ module Flow_mod :
       ?hard_timeout:uint16 ->
       ?buffer_id:int ->
       ?out_port:Port.t -> ?flags:flags -> Flow.action list -> unit -> t
-    val marshal_flow_mod : ?xid:int32 -> t -> Cstruct.buf -> int
+    val marshal_flow_mod : ?xid:int32 -> t -> Cstruct.t -> int
   end
 module Flow_removed :
   sig
@@ -355,6 +375,7 @@ module Flow_removed :
     val reason_of_int : int -> reason
     val int_of_reason : reason -> int
     val string_of_reason : reason -> string
+    val get_len : int
     type t = {
       of_match : Match.t;
       cookie : uint64;
@@ -366,8 +387,8 @@ module Flow_removed :
       packet_count : uint64;
       byte_count : uint64;
     }
-    val parse_flow_removed: Cstruct.buf  -> t
-    val marshal_flow_removed: ?xid:int32 -> t -> Cstruct.buf -> int
+    val parse_flow_removed: Cstruct.t  -> t
+    val marshal_flow_removed: ?xid:int32 -> t -> Cstruct.t -> int
     val flow_to_flow_removed: ?reason:reason -> duration_sec:int32 -> 
       duration_nsec:int32 -> packet_count:int64 -> byte_count:int64 ->
       Flow_mod.t -> t
@@ -377,7 +398,7 @@ module Port_mod :
   sig
     type t = {
       port_no : Port.t;
-      hw_addr : eaddr;
+      hw_addr : Macaddr.t;
       config : Port.config;
       mask : Port.config;
       advertise : Port.features;
@@ -391,9 +412,9 @@ module Stats :
     val string_of_table_id : table_id -> string
     
     type aggregate = {
-      packet_count : uint64;
-      byte_count : uint64;
-      flow_count : uint32;
+      mutable packet_count : uint64;
+      mutable byte_count : uint64;
+      mutable flow_count : uint32;
     }
     type table = {
       mutable table_id : table_id;
@@ -404,6 +425,7 @@ module Stats :
       mutable lookup_count : uint64;
       mutable matched_count : uint64;
     }
+    val init_table_stats : table_id -> string -> Wildcards.t -> table 
     type queue = {
       port_no : uint16;
       queue_id : uint32;
@@ -423,19 +445,20 @@ module Stats :
     val int_of_req_type : stats_type -> int
     val create_flow_stat_req :
       Match.t ->
-      ?table_id:int ->
-      ?out_port:Port.t -> ?xid:Int32.t -> Cstruct.buf -> Cstruct.buf 
+      ?table_id:table_id ->
+      ?out_port:Port.t -> ?xid:Int32.t -> Cstruct.t -> int 
     val create_aggr_flow_stat_req :
       Match.t ->
-      ?table_id:int ->
-      ?out_port:Port.t -> ?xid:Int32.t -> Cstruct.buf -> Cstruct.buf
-(*     val create_vendor_stat_req : ?xid:Int32.t -> Cstruct.buf -> unit *)
-    val create_table_stat_req : ?xid:Int32.t -> Cstruct.buf -> Cstruct.buf
+      ?table_id:table_id ->
+      ?out_port:Port.t -> ?xid:Int32.t -> Cstruct.t -> int
+(*     val create_vendor_stat_req : ?xid:Int32.t -> Cstruct.t -> unit *)
+    val create_desc_stat_req : ?xid:Int32.t -> Cstruct.t -> int
+    val create_table_stat_req : ?xid:Int32.t -> Cstruct.t -> int
     val create_queue_stat_req :
       ?xid:Int32.t ->
-      ?queue_id:int32 -> ?port:Port.t -> Cstruct.buf -> Cstruct.buf
+      ?queue_id:int32 -> ?port:Port.t -> Cstruct.t -> int
     val create_port_stat_req :
-      ?xid:Int32.t -> ?port:Port.t -> Cstruct.buf -> Cstruct.buf
+      ?xid:Int32.t -> ?port:Port.t -> Cstruct.t -> int
     type req =
         Desc_req of req_hdr
       | Flow_req of req_hdr * Match.t * table_id * Port.t
@@ -444,9 +467,12 @@ module Stats :
       | Port_req of req_hdr * Port.t
       | Queue_req of req_hdr * Port.t * queue_id
       | Vendor_req of req_hdr
-    type resp_hdr = { st_ty : stats_type; more_to_follow : bool; }
+    val marshal_stats_req : ?xid:int32 -> req -> Cstruct.t -> int
+    
+    type resp_hdr = { st_ty : stats_type; more : bool; }
     val int_of_stats_type : stats_type -> int
     val stats_type_of_int : int -> stats_type
+    val get_resp_hdr_size : int 
     type resp =
         Desc_resp of resp_hdr * desc
       | Flow_resp of resp_hdr * Flow.stats list
@@ -455,7 +481,10 @@ module Stats :
       | Port_resp of resp_hdr * Port.stats list
       | Queue_resp of resp_hdr * queue list
       | Vendor_resp of resp_hdr
-    val marshal_stats_resp : int32 -> resp -> Cstruct.buf -> int
+    val resp_get_len : resp -> int
+    val create_desc_stat_resp : string -> string -> string -> string -> string
+    -> desc
+    val marshal_stats_resp : int32 -> resp -> Cstruct.t -> int
     val string_of_stats : resp -> string
   end
 type error_code =
@@ -490,21 +519,21 @@ type error_code =
   | QUEUE_OP_BAD_PORT
   | QUEUE_OP_BAD_QUEUE
   | QUEUE_OP_EPERM
-val marshal_and_sub : (Cstruct.buf -> int) -> Cstruct.buf -> Cstruct.buf
-val marshal_and_shift : (Cstruct.buf -> int) -> Cstruct.buf -> (int * Cstruct.buf)
+val marshal_and_sub : (Cstruct.t -> int) -> Cstruct.t -> Cstruct.t
+val marshal_and_shift : (Cstruct.t -> int) -> Cstruct.t -> (int * Cstruct.t)
 (* val contain_exc : string -> `a -> `a option *)
 val error_code_of_int : int -> error_code
 val int_of_error_code : error_code -> uint32
 val string_of_error_code : error_code -> string
-val marshal_error : error_code -> Cstruct.buf -> int32 -> Cstruct.buf -> int
-val build_features_req : uint32 -> Cstruct.buf -> int
-val build_echo_resp : Header.h -> Cstruct.buf-> Cstruct.buf -> Cstruct.buf
+val marshal_error : error_code -> Cstruct.t -> int32 -> Cstruct.t -> int
+val build_features_req : uint32 -> Cstruct.t -> int
+val build_echo_resp : Header.h -> Cstruct.t -> int
 type t =
   Hello of Header.h 
-  | Error of Header.h * error_code
-  | Echo_req of Header.h * Cstruct.buf 
-  | Echo_resp of Header.h * Cstruct.buf
-  | Vendor of Header.h * vendor * Cstruct.buf 
+  | Error of Header.h * error_code * Cstruct.t 
+  | Echo_req of Header.h 
+  | Echo_resp of Header.h
+  | Vendor of Header.h * (* vendor *) Cstruct.t 
   | Features_req of Header.h
   | Features_resp of Header.h * Switch.features
   | Get_config_req of Header.h
@@ -522,4 +551,6 @@ type t =
   | Barrier_resp of Header.h
   | Queue_get_config_req of Header.h * Port.t
   | Queue_get_config_resp of Header.h * Port.t * Queue.t array
-val parse : Header.h -> Cstruct.buf -> t
+val parse : Header.h -> Cstruct.t -> t
+val marshal : t -> Cstruct.t
+val to_string : t -> string

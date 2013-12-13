@@ -19,37 +19,55 @@ open Printf
 open Net
 open Net.Nettypes
 
+let resolve t = Lwt.on_success t (fun _ -> ())
+
+module OP = Openflow.Ofpacket
+module OC = Openflow.Ofcontroller
+module OE = Openflow.Ofcontroller.Event
+open Ofswitch
+
+let pp = Printf.printf
+let sp = Printf.sprintf
+
 (****************************************************************
  * OpenFlow Switch configuration 
  *****************************************************************)
-
-let print_time () =
-  while_lwt true do
-    OS.Time.sleep 10.0 >>
-    return (printf "%03.6f: process running..\n%!" (OS.Clock.time ()))
-  done
-
-let switch_run () = 
-  let sw = Ofswitch.create_switch () in
-  try_lwt 
-    Manager.create ~devs:3 
-    (fun mgr interface id ->
-       match (Manager.get_intf_name mgr id) with 
-         | "tap0" ->
-             let ip = 
-                 (ipv4_addr_of_tuple (10l,0l,0l,1l),
-                  ipv4_addr_of_tuple (255l,255l,255l,0l), []) in  
-               lwt _ = Manager.configure interface (`IPv4 ip) in
-               let dst_ip = ipv4_addr_of_tuple (10l,0l,0l,2l) in
-               lwt _ = (Ofswitch.listen sw mgr (None, 6633) <&> 
-                       (print_time ())) in 
-                return ()
-      | _ -> 
-          return (Ofswitch.add_port mgr sw id)
-    )
+let switch_run () =
+(*  let delay = {flow_insert=0.; flow_update=0.; pktin_rate=50.; pktin_delay=0.002;
+  stats_delay=0.; pktout_delay=0.;} in *) 
+  let model = Ofswitch_model.(
+      {flow_insert=0.002;
+       flow_update=0.002; pktin_rate=18.; pktin_delay=0.002;stats_delay=0.;
+       pktout_delay=0.;}) in
+  let sw = create_switch 0x100L (* model *) in
+  let use_mac = ref true in 
+  try_lwt
+    Manager.create (fun mgr interface id ->
+        match (OS.Netif.string_of_id id) with 
+        | "tap0" 
+        | "0" ->
+          lwt _ = OS.Time.sleep 5.0 in
+          let _ = printf "connecting switch...\n%!" in 
+          let ip = Ipaddr.V4.(make 10l 20l 0l 100l, Prefix.mask 24, []) in  
+          lwt _ = Manager.configure interface (`IPv4 ip) in
+          let dst_ip = Ipaddr.V4.make 10l 20l 0l 4l in 
+          standalone_connect sw mgr (dst_ip, 6633) 
+      | str_id -> 
+(*          let find dev = 
+            try 
+              let _ = Re_str.search_forward (Re_str.regexp "tap") dev 0 in true
+            with Not_found -> false
+          in
+          lwt _ =
+            if (not (find str_id) ) then 
+              lwt _ = add_port mgr ~use_mac:(!use_mac) sw id in 
+                return (use_mac := false)
+            else *)
+              add_port mgr ~use_mac:false sw id
+(*          in 
+            return () *)
+    ) 
   with e ->
     Printf.eprintf "Error: %s" (Printexc.to_string e); 
     return ()
 
-
-let _ = OS.Main.run(switch_run ())

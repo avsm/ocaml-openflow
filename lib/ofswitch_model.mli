@@ -18,8 +18,17 @@ open Net
 
 type t
 
+type delay_model = {
+  flow_insert : float;
+  flow_update : float;
+  pktin_rate : float;
+  pktin_delay : float;
+  stats_delay : float;
+  pktout_delay: float;
+}
+
 (** [create dpid] initializes the state for a switch with a datapth id dpid *)
-val create_switch :  ?verbose:bool -> int64 -> t
+val create_switch :  ?verbose:bool -> int64 -> delay_model -> t
 
 (** Port Management *)
 
@@ -30,15 +39,6 @@ val del_port : Manager.t -> t -> string -> unit Lwt.t
 (** [add_port_local mgr st intf] add port intf as the local loopback interface
  * of th switch st *)
 val add_port_local : Manager.t -> t -> Manager.id -> unit Lwt.t
-
-(** Switch state management *)
-
-(** [add_flow st fl] add flow definition fl to the switch st *)
-val add_flow : t -> Openflow.Ofpacket.Flow_mod.t -> unit Lwt.t
-
-(** [del_flow st fl] remove all flows matching flow definition fl 
- * from the switch st *)
-val del_flow : t -> Openflow.Ofpacket.Match.t -> unit Lwt.t
 
 (** [get_flow_stats st fl] fetch statistics for flows matching flow definition
  * fl from the switch st *)

@@ -47,11 +47,20 @@ let get_new_buffer len =
   let buf = OS.Io_page.to_cstruct (OS.Io_page.get 1) in 
     Cstruct.sub buf 0 len 
 
-let get_ethif mgr id = 
+let get_intf mgr id = 
     let lst = Net.Manager.get_intfs mgr in 
-    let (_, ethif) = List.find (fun (dev_id,_) -> id = dev_id) lst in 
-    ethif
- 
+    let (_, intf) = List.find (fun (dev_id,_) -> id = dev_id) lst in 
+    intf
+
+type delay_model = {
+  flow_insert : float;
+  flow_update : float;
+  pktin_rate : float;
+  pktin_delay : float;
+  stats_delay : float;
+  pktout_delay: float;
+}
+  
 module Entry = struct
   type table_counter = {
     n_active: uint32;
@@ -86,7 +95,6 @@ module Entry = struct
      last_sec=ts;last_nsec=0; idle_timeout=t.OP.Flow_mod.idle_timeout; 
     hard_timeout=t.OP.Flow_mod.hard_timeout; flags=t.OP.Flow_mod.flags; }
 
-
   type t = { 
     counters: flow_counter;
     actions: OP.Flow.action list;
@@ -118,6 +126,12 @@ end
 
 module Table = struct
   type t = {
+    flow_add_queue: (OP.Match.t * (OP.Flow.action list -> unit Lwt.t) * Entry.t) Lwt_stream.t;
+    flow_add_push : ((OP.Match.t * (OP.Flow.action list -> unit Lwt.t) * Entry.t) option -> unit);
+
+    flow_upd_queue: (OP.Match.t * (OP.Flow.action list -> unit Lwt.t) * Entry.t) Lwt_stream.t;
+    flow_upd_push : ((OP.Match.t * (OP.Flow.action list -> unit Lwt.t) * Entry.t) option -> unit);
+
     tid: cookie;
     (* This entry stores wildcard and exact match entries as
      * transmitted by the controller *)
@@ -128,16 +142,45 @@ module Table = struct
     stats : OP.Stats.table;
   }
 
-  let init_table () = 
-    { tid = 0_L; entries = (Hashtbl.create 10000); cache = (Hashtbl.create 10000);
+  let init_table () =
+    let open OP.Wildcards in 
+    let (flow_add_queue, flow_add_push) = Lwt_stream.create () in
+    let (flow_upd_queue, flow_upd_push) = Lwt_stream.create () in
+    { tid = 0_L; flow_add_queue; flow_add_push; flow_upd_queue; flow_upd_push; 
+    entries = (Hashtbl.create 10000); cache = (Hashtbl.create 10000);
     stats = OP.Stats.(
-      {table_id=(OP.Stats.table_id_of_int 1); name="main_tbl"; 
-      wildcards=(OP.Wildcards.exact_match ()); max_entries=1024l; active_count=0l; 
+      {table_id=(table_id_of_int 1); name="main_tbl"; 
+      wildcards=(exact_match ()); max_entries=1024l; active_count=0l; 
       lookup_count=0L; matched_count=0L});}
 
+  let add_flow_nodelay table verbose m entry process_bid =
+    let open OP.Flow_mod in 
+    let open OP.Match in 
+    let _ = Hashtbl.replace table.entries m entry in
+    (* In the fast path table, I need to delete any conflicting entries *)
+    let _ = 
+      Hashtbl.iter (
+        fun a e -> 
+          if ((flow_match_compare a m m.wildcards) && 
+              Entry.(entry.counters.priority >= (!e).counters.priority)) then ( 
+            let _ = (!e).Entry.cache_entries <- 
+                List.filter (fun c -> a <> c) (!e).Entry.cache_entries in 
+            let _ = Hashtbl.replace table.cache a (ref entry) in 
+            entry.Entry.cache_entries <- a :: entry.Entry.cache_entries
+          )
+      ) table.cache in
+    let _ = ignore_result (process_bid entry.Entry.actions) in 
+(*    if (bid = -1l) then return () 
+    else process_buffer_id st t msg h.xid bid entry.Entry.actions *)
+
+    let _ = if (verbose) then 
+        cp (sp "[switch] Adding flow %s" (OP.Match.match_to_string m))
+    in 
+    ()
+
+
   (* TODO fix flow_mod flag support. overlap is not considered *)
-  let add_flow st table t verbose =
-    (* TODO check if the details are correct e.g. IP type etc. *)
+  let add_flow table t verbose process_bid =
     let open OP.Flow_mod in 
     let open OP.Match in 
     let _ =
@@ -145,25 +188,29 @@ module Table = struct
       if  (t.of_match.wildcards=(OP.Wildcards.exact_match ())) then
         t.priority <- 0x1001
     in
-    let entry = Entry.({actions=t.OP.Flow_mod.actions; counters=(init_flow_counters t); 
-             cache_entries=[];}) in  
-    let _ = Hashtbl.replace table.entries t.of_match entry in
-    (* In the fast path table, I need to delete any conflicting entries *)
-    let _ = 
-      Hashtbl.iter (
-        fun a e -> 
-          if ((flow_match_compare a t.of_match t.of_match.wildcards) && 
-              Entry.(entry.counters.priority >= (!e).counters.priority)) then ( 
-                let _ = (!e).Entry.cache_entries <- 
-                  List.filter (fun c -> a <> c) (!e).Entry.cache_entries in 
-                let _ = Hashtbl.replace table.cache a (ref entry) in 
-                  entry.Entry.cache_entries <- a :: entry.Entry.cache_entries
-              )
-      ) table.cache in
-    let _ = if (verbose) then 
-        cp (sp "[switch] Adding flow %s" (OP.Match.match_to_string t.of_match))
-    in
-    return ()
+    let entry = Entry.({actions=t.OP.Flow_mod.actions; 
+                        counters=(init_flow_counters t); cache_entries=[];}) in  
+    if (Hashtbl.mem table.entries t.of_match) then
+      table.flow_upd_push (Some (t.of_match, process_bid, entry)) 
+    else
+      table.flow_add_push (Some (t.of_match, process_bid, entry) )
+
+    (* TODO check if the details are correct e.g. IP type etc. *)
+  let add_flow_t st table delay verbose = 
+    while_lwt true do
+      lwt (m, bid, entry) = Lwt_stream.next table.flow_add_queue in
+      lwt () = OS.Time.sleep delay in
+      let () = add_flow_nodelay table verbose m entry bid in
+      return ()
+    done
+  let upd_flow_t table delay verbose = 
+    while_lwt true do
+      lwt (m, bid, entry) = Lwt_stream.next table.flow_upd_queue in
+      lwt () = OS.Time.sleep delay in
+      let () = add_flow_nodelay table verbose m entry bid in
+      return ()
+    done
+
 
   (* check if a list of actions has an output action forwarding packets to
    * out_port.
@@ -172,7 +219,7 @@ module Table = struct
   let rec is_output_port out_port = function
     | [] -> false
     | OP.Flow.Output(port, _)::_ when (port = out_port) -> true
-    | head::tail -> is_output_port out_port tail 
+    | _ :: tail -> is_output_port out_port tail 
 
   let del_flow table ?(xid=(Random.int32 Int32.max_int)) 
         ?(reason=OP.Flow_removed.DELETE) tuple out_port t verbose =
@@ -185,22 +232,7 @@ module Table = struct
               ((out_port = OP.Port.No_port) || 
                (is_output_port out_port flow.Entry.actions))) then ( 
             let _ = Hashtbl.remove table.entries of_match in 
-            
-            (* log removal of flow *)
-(*            let _ = 
-              match Lwt.get OS.Topology.node_name with
-              | None -> ()
-              | Some(node_name) -> 
-                  let flow_str = OP.Match.match_to_string of_match in
-                  let action_str = OP.Flow.string_of_actions flow.Entry.actions in
-                  let msg = Rpc.Dict [ 
-                    ("name", (Rpc.String node_name));
-                    ("type", (Rpc.String "del"));
-                    ("flow", (Rpc.String flow_str)); 
-                    ("action", (Rpc.String action_str));] in
-                    OS.Console.broadcast "flow" (Jsonrpc.to_string msg)
-    in *)
-               (of_match, flow)::ret
+            (of_match, flow)::ret
           ) else ret
           ) table.entries [] in
 
@@ -238,12 +270,12 @@ module Table = struct
   (* table stat update methods *)
   let update_table_found table =
     let open OP.Stats in 
-    table.stats.lookup_count <- Int64.add table.stats.lookup_count 1L;
-    table.stats.matched_count <- Int64.add table.stats.matched_count 1L
+    table.stats.lookup_count <- Int64.succ table.stats.lookup_count;
+    table.stats.matched_count <- Int64.succ table.stats.matched_count
 
   let update_table_missed table =
     let open OP.Stats in 
-    table.stats.lookup_count <- Int64.add table.stats.lookup_count 1L
+    table.stats.lookup_count <- Int64.succ table.stats.lookup_count
 
   (* monitor thread to timeout flows *)
   let monitor_flow_timeout table t verbose = 
@@ -276,11 +308,9 @@ end
 
 module Switch = struct
   type port = {
-    mgr: Net.Manager.t;
     port_id: int;
     ethif: Net.Manager.id; 
     netif: OS.Netif.t;
-    port_name: string;
     counter: OP.Port.stats;
     phy: OP.Port.phy;
     in_queue: Cstruct.t Lwt_stream.t;
@@ -291,10 +321,8 @@ module Switch = struct
   }
 
   let init_port mgr port_no id =
-
-    let ethif = Net.Manager.get_ethif ( get_ethif mgr id ) in 
+    let ethif = Net.Manager.get_ethif ( get_intf mgr id ) in 
     let netif = Net.Ethif.get_netif ethif in 
-    let name = OS.Netif.string_of_id (OS.Netif.id (Net.Ethif.get_netif ethif )) in 
     let hw_addr = Net.Ethif.mac ethif in
     let (in_queue, in_push) = Lwt_stream.create () in
     let (out_queue, out_push) = Lwt_stream.create () in
@@ -317,11 +345,11 @@ module Switch = struct
         {link_down =false; stp_listen =false; stp_learn =false;
          stp_forward =false; stp_block =false;}) in
     let phy = OP.Port.(
-        {port_no; hw_addr;name; config= port_config;
+        {port_no; hw_addr;name=(OS.Netif.string_of_id id); config= port_config;
          state= port_state; curr=features; advertised=features; 
          supported=features; peer=features;}) in
     
-    {port_id=port_no; mgr; port_name=name; counter;
+    {port_id=port_no; counter;
      ethif=id;netif;phy;in_queue;in_push;pkt_count=0;
         out_queue;out_push;}
 
@@ -337,15 +365,12 @@ module Switch = struct
        | NOT_FOUND
 
   type t = {
-    (* Mapping Netif objects to ports *)
-    mutable dev_to_port: (Net.Manager.id, port ref) Hashtbl.t;
-
     (* Mapping port ids to port numbers *)
-    mutable int_to_port: (int, port ref) Hashtbl.t;
-    mutable ports : port list;
+    ports: (int, port) Hashtbl.t;
     mutable controller: OSK.conn_state option;
     mutable last_echo_req : float;
     mutable echo_resp_received : bool;
+    model : delay_model;
     table: Table.t;
     stats: stats;
     mutable errornum : uint32; 
@@ -355,7 +380,17 @@ module Switch = struct
     mutable packet_buffer_id: int32;
     ready : unit Lwt_condition.t ;
     verbose : bool;
+
+    pktin_queue: OP.t Lwt_stream.t;
+    pktin_push : OP.t option -> unit;
+
+    pktout_queue: (Cstruct.t * int) Lwt_stream.t;
+    pktout_push : (Cstruct.t * int) option -> unit;
+
+    stats_queue: (Cstruct.t * int) Lwt_stream.t;
+    stats_push : (Cstruct.t * int) option -> unit;
   }
+
  let supported_actions () = 
    OP.Switch.({ output=true; set_vlan_id=true; set_vlan_pcp=true; strip_vlan=true;
    set_dl_src=true; set_dl_dst=true; set_nw_src=true; set_nw_dst=true;
@@ -364,9 +399,8 @@ module Switch = struct
    OP.Switch.({flow_stats=true;table_stats=true;port_stats=true;stp=true;
    ip_reasm=false;queue_stats=false;arp_match_ip=true;})
  let switch_features datapath_id = 
-   OP.Switch.({datapath_id; n_buffers=0l; n_tables=(char_of_int 1); 
-   capabilities=(supported_capabilities ()); actions=(supported_actions ()); 
-   ports=[];})
+   OP.Switch.({datapath_id; n_buffers=0l; n_tables=(char_of_int 1); ports=[]; 
+   capabilities=(supported_capabilities ()); actions=(supported_actions ()); })
 
 
   let update_port_tx_stats pkt_len port = 
@@ -446,11 +480,44 @@ module Switch = struct
 
   let send_packet port bits =
     update_port_tx_stats (Int64.of_int (Cstruct.len bits)) port;
-    return (port.out_push (Some bits))
-(*    OS.Netif.write port.netif bits *)
+(*    return (port.out_push (Some bits)) *)
+    Lwt.ignore_result (OS.Netif.write port.netif bits)
 (*    Net.Manager.inject_packet port.mgr port.ethif bits *)
 
-  
+  let process_pktin_nodelay st pkt =
+    match st.controller with
+    | None ->(* return *)()
+    | Some conn -> Lwt.ignore_result (OSK.send_packet conn pkt)
+
+
+  let process_pktin st pkt = 
+    if (st.model.pktin_delay > 0.) then 
+      (st.pktin_push (Some pkt) )
+    else 
+      process_pktin_nodelay st pkt 
+
+  let pktin_t st delay rate =
+    let start_ts = ref 0.0 in 
+(*    let (fraction, _) = modf !start_ts in *)
+    let counter = ref 0.0 in 
+    while_lwt true do
+      lwt pktin = Lwt_stream.next st.pktin_queue in
+      let now = OS.Clock.time () in 
+      let () = 
+        if ((!start_ts +. 1.0) < now) then
+          let _ = counter := 0. in
+          start_ts := (floor now)
+      in 
+      if ((rate = 0.) || (!counter <= rate)) then
+        lwt () = OS.Time.sleep delay in
+        counter := !counter +. 1.;
+        return (process_pktin_nodelay st pktin)
+      else
+        let _ = Printf.printf "%f: counter = %f, start_ts %f dropping packet\n%!" 
+                  now !counter !start_ts in 
+        return ()
+    done 
+ 
   let forward_frame st in_port bits pkt_size checksum port = 
     let _ = 
       if ((checksum) && ((get_dl_header_dl_type bits) = 0x800)) then
@@ -477,34 +544,32 @@ module Switch = struct
     in 
     match port with 
     | OP.Port.Port(port) -> 
-      if Hashtbl.mem st.int_to_port port then
-        let out_p = (!( Hashtbl.find st.int_to_port port))  in
+      if Hashtbl.mem st.ports port then
+        let out_p = (Hashtbl.find st.ports port)  in
         send_packet out_p bits 
 (*          Net.Manager.inject_packet out_p.mgr out_p.ethif bits *)
       else
-        return (cp (sp "[switch] forward_frame: Port %d not registered\n%!" port))
-    | OP.Port.No_port -> return ()
+       (* return *)(cp (sp "[switch] forward_frame: Port %d not registered\n%!" port))
+    | OP.Port.No_port ->(* return *)()
     | OP.Port.Flood 
     |OP.Port.All ->
-      Lwt_list.iter_p  
-        (fun port -> 
-           if(port.port_id != (OP.Port.int_of_port in_port)) then 
-             send_packet port bits
-           else 
-             return ()
-        ) st.ports
+        let inp = OP.Port.int_of_port in_port in
+      (*Lwt_l*)List.iter 
+        (fun port -> send_packet port bits) 
+        (Hashtbl.fold (fun ix p r -> 
+          if(ix != inp) then p::r else r) st.ports [])
     | OP.Port.In_port ->
       let port = (OP.Port.int_of_port in_port) in 
-      if Hashtbl.mem st.int_to_port port then
-        send_packet (!(Hashtbl.find st.int_to_port port))  bits
+      if Hashtbl.mem st.ports port then
+        send_packet (Hashtbl.find st.ports port)  bits
       else
-        return (cp (sp "[switch] forward_frame: Port %d unregistered\n%!" port))
+       (* return *)(cp (sp "[switch] forward_frame: Port %d unregistered\n%!" port))
     | OP.Port.Local ->
       let local = OP.Port.int_of_port OP.Port.Local in 
-      if Hashtbl.mem st.int_to_port local then
-        send_packet !(Hashtbl.find st.int_to_port local) bits
+      if Hashtbl.mem st.ports local then
+        send_packet (Hashtbl.find st.ports local) bits
       else
-        return (cp (sp "[switch] forward_frame: Port %d unregistered \n%!" local))
+       (* return *)(cp (sp "[switch] forward_frame: Port %d unregistered \n%!" local))
     | OP.Port.Controller -> begin 
       let size = 
          if (Cstruct.len bits > pkt_size) then
@@ -515,61 +580,59 @@ module Switch = struct
        let (h, pkt_in) = 
          OP.Packet_in.(create_pkt_in ~buffer_id:(-1l) ~in_port 
                       ~reason:ACTION ~data:(Cstruct.sub bits 0 size)) in
-       match st.controller with
-       | None -> return ()
-       | Some conn -> OSK.send_packet conn (OP.Packet_in (h, pkt_in))
+       process_pktin st (OP.Packet_in (h, pkt_in))      
     end 
         (*           | Table
          *           | Normal  *)
         | _ -> 
-            return (cp (sp "[switch] forward_frame: unsupported output port\n"))
+           (* return *)(cp (sp "[switch] forward_frame: unsupported output port\n"))
 
   (* Assumwe that action are valid. I will not get a flow that sets an ip
    * address unless it defines that the ethType is ip. Need to enforce
    * these rule in the parsing process of the flow_mod packets *)
   let apply_of_actions st in_port bits actions =
     let apply_of_actions_inner st in_port bits checksum action =
-      try_lwt 
+      try (*_lwt *)
         match action with
         | OP.Flow.Output (port, pkt_size) ->
           (* Make a packet copy in case the buffer is modified and multiple
            * outputs are defined? *)
-          lwt _ = forward_frame st in_port bits pkt_size checksum port in 
-          return false
+          let _ = forward_frame st in_port bits pkt_size checksum port in 
+         (* return *)false
         | OP.Flow.Set_dl_src(eaddr) ->
           let _ = set_dl_header_dl_src (Macaddr.to_bytes eaddr) 0 bits in 
-          return checksum
+         (* return *)checksum
         | OP.Flow.Set_dl_dst(eaddr) ->
           let _ = set_dl_header_dl_dst (Macaddr.to_bytes eaddr) 0 bits in 
-          return checksum
+         (* return *)checksum
   (* TODO: Add for this actions to check when inserted if 
     * the flow is an ip flow *)
         | OP.Flow.Set_nw_tos(tos) -> 
           let ip_data = Cstruct.shift bits sizeof_dl_header in
           let _ = set_nw_header_nw_tos ip_data (int_of_char tos) in
-          return true
+         (* return *)true
   (* TODO: wHAT ABOUT ARP?
    * *)
         | OP.Flow.Set_nw_src(ip) -> 
           let ip_data = Cstruct.shift bits sizeof_dl_header in
           let _ = set_nw_header_nw_src ip_data (Ipaddr.V4.to_int32 ip) in 
-          return true
+         (* return *)true
         | OP.Flow.Set_nw_dst(ip) -> 
           let ip_data = Cstruct.shift bits sizeof_dl_header in
           let _ = set_nw_header_nw_dst ip_data (Ipaddr.V4.to_int32 ip) in 
-          return true
+         (* return *)true
         | OP.Flow.Set_tp_src(port) ->
           let ip_data = Cstruct.shift bits sizeof_dl_header in
           let len = (get_nw_header_hlen_version ip_data) land 0xf in 
           let tp_data = Cstruct.shift ip_data (len*4) in
           let _ = set_tp_header_tp_src tp_data port in 
-          return true
+         (* return *)true
         | OP.Flow.Set_tp_dst(port) ->
           let ip_data = Cstruct.shift bits sizeof_dl_header in
           let len = (get_nw_header_hlen_version ip_data) land 0xf in 
           let tp_data = Cstruct.shift ip_data (len*4) in 
           let _ = set_tp_header_tp_dst tp_data port in 
-          return true
+         (* return *)true
   (*      | OP.Flow.Enqueue(_, _)
           | OP.Flow.Set_vlan_pcp _
           | OP.Flow.Set_vlan_vid _
@@ -578,21 +641,20 @@ module Switch = struct
         | act ->
           let _ = cp (sp "[switch] apply_of_actions: Unsupported action %s" 
                         (OP.Flow.string_of_action act)) in 
-          return checksum
+         (* return *)checksum
       with exn -> 
         let _ = cp(sp  "[switch] apply_of_actions: (packet size %d) %s %s\n%!" 
                      (Cstruct.len bits) (OP.Flow.string_of_action action) 
                      (Printexc.to_string exn )) in
-        return checksum
+       (* return *)checksum
     in
     let rec apply_of_actions_rec st in_port bits checksum = function
-      | [] -> return false
+      | [] ->(* return *)false
       | head :: actions -> 
-        lwt checksum = apply_of_actions_inner st in_port bits checksum head in
+        let checksum = apply_of_actions_inner st in_port bits checksum head in
         apply_of_actions_rec st in_port bits checksum actions 
     in 
-    lwt _ = apply_of_actions_rec st in_port bits false actions in
-    return ()
+    let _ = apply_of_actions_rec st in_port bits false actions in ()
       
    let lookup_flow st of_match =
      (* Check first the match table cache
@@ -633,7 +695,7 @@ type t = Switch.t
 let process_frame_inner st p frame =
   let open Switch in
   let open OP.Packet_in in
-  try_lwt
+  try
     let in_port = (OP.Port.port_of_int p.Switch.port_id) in 
     let tupple = (OP.Match.raw_packet_to_match in_port frame ) in
     (* Update port rx statistics *)
@@ -645,7 +707,7 @@ let process_frame_inner st p frame =
       Table.update_table_missed st.table;
       let buffer_id = st.packet_buffer_id in
          (*TODO Move this code in the Switch module *)
-       st.packet_buffer_id <- Int32.add st.packet_buffer_id 1l;
+       st.packet_buffer_id <- Int32.succ st.packet_buffer_id;
        let (h, pkt_in) = create_pkt_in ~buffer_id ~in_port ~reason:NO_MATCH ~data:frame in 
        st.packet_buffer <- pkt_in::st.packet_buffer; 
 
@@ -655,11 +717,13 @@ let process_frame_inner st p frame =
          else Cstruct.len frame in
        let (h, pkt_in) = create_pkt_in ~buffer_id ~in_port ~reason:NO_MATCH 
            ~data:(Cstruct.sub frame 0 size) in
-       return (
-         match st.Switch.controller with
+       process_pktin st (OP.Packet_in(h,pkt_in))
+(*       return ( *)
+(*         ( match st.Switch.controller with
           | None -> ()
           | Some conn -> ignore_result (OSK.send_packet conn (OP.Packet_in(h,pkt_in)))
        )
+          *)
       end
        (* generate a packet in event *)
     | Switch.Found(entry) ->
@@ -667,76 +731,29 @@ let process_frame_inner st p frame =
       let _ = Entry.update_flow (Int64.of_int (Cstruct.len frame)) !entry in
       apply_of_actions st tupple.OP.Match.in_port frame (!entry).Entry.actions
   with exn ->
-    return (cp (sp "[switch] process_frame_inner: control channel error: %s\n" 
+    (* return *) (cp (sp "[switch] process_frame_inner: control channel error: %s\n" 
         (Printexc.to_string exn)))
 
-let check_packets st = 
-  match_lwt (Lwt_list.exists_p (fun p -> return (p.Switch.pkt_count > 0))
-  st.Switch.ports) with
-  | false -> OS.Time.sleep 0.5 
-  | true -> return ()
-
 let forward_thread st =
-(*  while_lwt true do
-    lwt _ = check_packets st <?> Lwt_condition.wait st.Switch.ready in 
-    Lwt_list.iter_s (fun p ->
-(*      lwt empty = Lwt_stream.is_empty p.Switch.queue in *)
-      if (p.Switch.pkt_count = 0) then
-(*        let _ = cp (sp "port %d no packets\n" p.Switch.port_id) in *)
-        return ()
-      else
-        lwt frames = Lwt_stream.nget p.Switch.pkt_count p.Switch.queue in
-        lwt _ = 
-          Lwt_list.iter_p 
-          (fun f -> 
-            p.Switch.pkt_count <- p.Switch.pkt_count - 1; process_frame_inner st p f) 
-          frames in 
-(*        let _ = cp (sp "port %d got packet\n" p.Switch.port_id) in *)
-(*        let _ = cp (sp "port %d processed packet\n" p.Switch.port_id) in *)
-        return ()
-    ) st.Switch.ports 
-  done *)
   Lwt_list.iter_p (fun p ->
     while_lwt true do
-(*      if (p.Switch.pkt_count > 0) then 
-        lwt frames = Lwt_stream.nget 10 p.Switch.queue in 
-        Lwt_list.iter_p (
-          fun f -> p.Switch.pkt_count <- p.Switch.pkt_count - 1; 
-          process_frame_inner st p f) frames
-      else *)
-        lwt _ = Lwt_stream.next p.Switch.in_queue >>= process_frame_inner st p in
-(*       let _ = 
-        if (p.Switch.pkt_count mod 20 = 1) then
-       cp (sp "port %d got packet %d" p.Switch.port_id p.Switch.pkt_count) in
-      *        *)
-        return (p.Switch.pkt_count <- p.Switch.pkt_count - 1)
+      lwt pkt = Lwt_stream.next p.Switch.in_queue in 
+      let _ = process_frame_inner st p pkt in
+      return (p.Switch.pkt_count <- p.Switch.pkt_count - 1)
     done <&> (
     while_lwt true do
         lwt frame = Lwt_stream.next p.Switch.out_queue in
-(*        lwt _ = OS.Time.sleep 0.0 in *)
-(*        let frames = Lwt_stream.get_available p.Switch.out_queue in*)
-(*        let _ = Printf.printf "got %d packets\n%!" (1+(List.length frames)) in
-   *        *)
         OS.Netif.writev p.Switch.netif [frame] (*frame::frames*)
     done
     )
-    ) st.Switch.ports 
+    ) (Hashtbl.fold (fun _ p c -> p::c) st.Switch.ports []) 
 
 let process_frame st p _ frame =
   let _ = 
     try 
       match frame with
       | Net.Ethif.Output _ -> ()
-      | Net.Ethif.Input frame ->
-(*        let _ = Lwt_condition.broadcast st.Switch.ready () in *)
-(*          if (p.Switch.pkt_count < 1000) then *)
-            let _ = p.Switch.pkt_count <- p.Switch.pkt_count + 1 in
-(*            let _ = Printf.printf "pushing packet to port %d %d\n%!"
-                p.Switch.port_id p.Switch.pkt_count in *)
-            p.Switch.in_push (Some frame)
-(*            Printf.printf "pushed packet to port %d\n%!" p.Switch.port_id*)
-(*          else
-            cp "[process_frame] blocked queue" *)
+      | Net.Ethif.Input frame -> process_frame_inner st p frame
     with 
     | Not_found -> cp (sp "[switch] process_frame: Invalid port\n%!")
     | Packet_type_unknw -> cp (sp "[switch] process_frame: malformed packet\n%!")
@@ -774,7 +791,8 @@ let process_buffer_id st t msg xid buffer_id actions =
     let h = create ~xid ERROR (get_len + 4 + (Cstruct.len bits)) in 
     OSK.send_packet t (OP.Error(h, OP.REQUEST_BUFFER_UNKNOWN, bits)) 
   | Some(pkt_in) ->
-    OP.Packet_in.(Switch.apply_of_actions st pkt_in.in_port pkt_in.data actions)
+    return (OP.Packet_in.(Switch.apply_of_actions st pkt_in.in_port pkt_in.data
+    actions))
 
 let process_openflow st t msg =
   let open OP.Header in 
@@ -791,9 +809,10 @@ let process_openflow st t msg =
    let xid = h.xid in 
    match req with
    | OP.Stats.Desc_req(req) ->
-     let p = OP.Stats.(Desc_resp ({st_ty=DESC; more=false;},
-                                  (create_desc_stat_resp "Mirage" "Mirage" "Mirage"
-                                  "0.1" "Mirage"))) in 
+     let p = OP.Stats.(
+       Desc_resp({st_ty=DESC; more=false;},
+                 {imfr_desc="Mirage"; hw_desc="Mirage";
+                  sw_desc="Mirage";serial_num="0.1";dp_desc="Mirage";})) in 
       let h = create ~xid STATS_RESP (OP.Stats.resp_get_len p) in 
         OSK.send_packet t (OP.Stats_resp (h, p))
    | OP.Stats.Flow_req(req_h, of_match, table_id, out_port) ->
@@ -842,16 +861,17 @@ let process_openflow st t msg =
    | OP.Stats.Port_req(req_h, port) -> begin
        match port with
        | OP.Port.No_port -> 
-         let port_stats = List.map (fun p -> p.Switch.counter) st.Switch.ports in
+         let port_stats = Hashtbl.fold (fun ix p r -> p.Switch.counter::r)
+         st.Switch.ports [] in
          let stats = OP.Stats.({st_ty=PORT; more=false;}) in 
          let r = OP.Stats.Port_resp(stats, port_stats) in 
          let h = OP.Header.create ~xid OP.Header.STATS_RESP (OP.Stats.resp_get_len r) in 
          OSK.send_packet t (OP.Stats_resp (h, r)) 
        | OP.Port.Port(port_id) -> begin
            try_lwt 
-            let port = Hashtbl.find st.Switch.int_to_port port_id in
+            let port = Hashtbl.find st.Switch.ports port_id in
             let stats = OP.Stats.({st_ty=PORT; more=false;}) in 
-            let r = OP.Stats.Port_resp(stats, [(!port).Switch.counter]) in 
+            let r = OP.Stats.Port_resp(stats, [port.Switch.counter]) in 
             let h = create ~xid STATS_RESP (OP.Stats.resp_get_len r) in 
             OSK.send_packet t (OP.Stats_resp (h, r))
            with Not_found ->
@@ -880,7 +900,7 @@ let process_openflow st t msg =
  | OP.Packet_out(h, pkt) ->
    let open OP.Packet_out in 
    if (pkt.buffer_id = -1l) then
-     Switch.apply_of_actions st pkt.in_port pkt.data pkt.actions
+     return (Switch.apply_of_actions st pkt.in_port pkt.data pkt.actions)
    else begin
      process_buffer_id st t msg h.xid pkt.buffer_id pkt.actions 
    end 
@@ -890,17 +910,30 @@ let process_openflow st t msg =
         match (fm.command) with
           | ADD 
           | MODIFY 
-          | MODIFY_STRICT -> 
-            Table.add_flow st st.Switch.table fm st.Switch.verbose
+          | MODIFY_STRICT ->
+              let process_bid st t msg xid bid actions = 
+                if (bid = -1l) then 
+                  return ()
+                else 
+                  process_buffer_id st t msg xid bid actions 
+              in
+            if (st.Switch.model.flow_insert > 0.) then 
+              return (Table.add_flow st.Switch.table fm st.Switch.verbose
+              (process_bid st t msg h.xid fm.buffer_id) )
+            else 
+              let entry = 
+                Entry.({actions=fm.OP.Flow_mod.actions; 
+                        counters=(init_flow_counters fm); cache_entries=[];}) in  
+              return (Table.add_flow_nodelay st.Switch.table st.Switch.verbose 
+                        fm.OP.Flow_mod.of_match entry 
+                (process_bid st t msg h.xid fm.buffer_id) )
           | DELETE 
           | DELETE_STRICT ->
             (* Need to implemente strict deletion in order to enable signpost
              * switching *)
             Table.del_flow st.Switch.table fm.of_match fm.out_port (Some t) st.Switch.verbose 
-      in
-      if (fm.buffer_id = -1l) then return () 
-      else process_buffer_id st t msg h.xid fm.buffer_id fm.actions
-  | OP.Set_config (h, _) -> return ()
+        in
+        return ()
   | OP.Queue_get_config_resp (h, _, _)
   | OP.Queue_get_config_req (h, _)
   | OP.Barrier_resp h
@@ -909,6 +942,7 @@ let process_openflow st t msg =
   | OP.Port_status (h, _)
   | OP.Flow_removed (h, _)
   | OP.Packet_in (h, _)
+  | OP.Set_config (h, _)
   | OP.Get_config_resp (h, _)
   | OP.Features_resp (h, _)
   | OP.Vendor (h, _)
@@ -962,21 +996,18 @@ let control_channel st (addr, port) t =
 (*
  * Interaface with external applications
  * *)
-let get_port_name mgr a = 
-  let ethif = Net.Manager.get_ethif (get_ethif mgr a) in 
+let get_port_name mgr id = 
+  let ethif = Net.Manager.get_ethif (get_intf mgr id) in 
   OS.Netif.string_of_id (OS.Netif.id (Net.Ethif.get_netif ethif))
 
 let add_port mgr ?(use_mac=false) sw id = 
   sw.Switch.portnum <- sw.Switch.portnum + 1;
-  let ethif = Net.Manager.get_ethif (get_ethif mgr id) in 
+  let ethif = Net.Manager.get_ethif (get_intf mgr id) in 
   let hw_addr =  Macaddr.to_string (Net.Ethif.mac ethif) in
-  let dev_name = get_port_name mgr id in
   let _ = OS.Console.log (sp "[switch] Adding port %d (%s) '%s' \n %!" 
-                            sw.Switch.portnum dev_name  hw_addr) in 
+                            sw.Switch.portnum (OS.Netif.string_of_id id)  hw_addr) in 
   let port = Switch.init_port mgr sw.Switch.portnum id in
-  sw.Switch.ports <- sw.Switch.ports @ [port];
-  Hashtbl.add sw.Switch.int_to_port sw.Switch.portnum (ref port); 
-  Hashtbl.add sw.Switch.dev_to_port id (ref port);
+  Hashtbl.add sw.Switch.ports sw.Switch.portnum port; 
   sw.Switch.features.OP.Switch.ports  <- 
     sw.Switch.features.OP.Switch.ports @ [port.Switch.phy];
   let _ = Net.Manager.set_promiscuous mgr id (process_frame sw port) in
@@ -988,12 +1019,11 @@ let add_port mgr ?(use_mac=false) sw id =
 let del_port mgr sw name =
   try_lwt
     let open Switch in 
-    let port = 
-      List.find (fun a -> (get_port_name mgr a.ethif) = name) sw.ports in 
-    let _ = 
-      sw.ports <- List.filter (fun a -> (get_port_name mgr a.ethif) <> name ) sw.ports in 
-    let _ = Hashtbl.remove sw.int_to_port port.port_id in  
-    let _ = Hashtbl.remove sw.dev_to_port port.ethif in 
+    let ix = Hashtbl.fold (fun ix p r -> 
+      if (OS.Netif.string_of_id p.ethif = name) then ix else r) sw.ports 0 in
+    let port = Hashtbl.find sw.ports ix in
+    let _ =
+      Hashtbl.remove sw.ports ix in 
     let h,p = OP.Port.create_port_status OP.Port.DEL port.phy in 
     let of_match = OP.Match.create_flow_match (OP.Wildcards.full_wildcard ()) () in 
     lwt _ = Table.del_flow sw.table of_match 
@@ -1015,13 +1045,7 @@ let add_port_local mgr sw ethif =
 let open Switch in 
   let local_port_id = OP.Port.int_of_port OP.Port.Local in 
   let port = init_port mgr local_port_id ethif in 
-  sw.ports <- port :: (List.filter (fun a -> (a.port_id <> 0)) sw.ports);
-  Hashtbl.replace sw.int_to_port local_port_id (ref port); 
-  Hashtbl.iter 
-    (fun a b -> if (!b.port_id = local_port_id) then 
-         Hashtbl.remove sw.dev_to_port a
-    ) sw.dev_to_port;
-  Hashtbl.add sw.dev_to_port ethif (ref port);
+  Hashtbl.replace sw.ports local_port_id port; 
   (*TODO Need to filter out any 0 port *)
   sw.features.OP.Switch.ports <- 
     port.phy ::
@@ -1031,44 +1055,50 @@ let open Switch in
                 (OS.Netif.string_of_id ethif) local_port_id) in 
   return (Net.Manager.set_promiscuous mgr ethif (process_frame sw port))
 
-let add_flow st fm = Switch.(Table.add_flow st st.table fm st.verbose)
-let del_flow st m = 
-  Switch.(Table.del_flow st.table m OP.Port.No_port st.controller st.verbose)
- 
-let create_switch ?(verbose=false) dpid = 
-  Switch.(
-    { ports = []; int_to_port = (Hashtbl.create 64); dev_to_port=(Hashtbl.create 64); 
-      controller=None; errornum = 0l; portnum=0; 
-      stats={n_frags=0L; n_hits=0L;n_missed=0L;n_lost=0L;};
-      table = (Table.init_table ()); features=(Switch.switch_features dpid); 
-      packet_buffer=[]; last_echo_req=0.; echo_resp_received=true;
-      packet_buffer_id=0l;ready=(Lwt_condition.create ());
-      verbose;})
+let create_switch ?(verbose=false) dpid model =
+  let open Switch in
+  let (pktin_queue, pktin_push) = Lwt_stream.create () in
+  let (stats_queue, stats_push) = Lwt_stream.create () in
+  let (pktout_queue, pktout_push) = Lwt_stream.create () in
+  let st = Switch.(
+      { ports = (Hashtbl.create 64); 
+        controller=None; errornum = 0l; portnum=0; model;
+        stats={n_frags=0L; n_hits=0L;n_missed=0L;n_lost=0L;};
+        table = (Table.init_table ()); features=(Switch.switch_features dpid); 
+        packet_buffer=[]; last_echo_req=0.; echo_resp_received=true;
+        packet_buffer_id=0l;ready=(Lwt_condition.create ());
+        verbose;pktin_queue;
+        pktin_push;pktout_queue;pktout_push;stats_queue;stats_push;}) in
+  let _ = 
+    if (st.model.flow_insert > 0.) then 
+      let _ = ignore_result (Table.add_flow_t st st.Switch.table
+                       st.Switch.model.flow_insert  st.Switch.verbose) in 
+      ignore_result (Table.upd_flow_t st.Switch.table st.Switch.model.flow_update 
+                       st.Switch.verbose)
+  in
+  let _ = 
+    if (st.Switch.model.pktin_delay > 0.) || (st.Switch.model.pktin_rate > 0.) then
+       ignore_result (Switch.pktin_t st st.Switch.model.pktin_delay
+                        st.Switch.model.pktin_rate)
+  in
+  st
 
 let listen st mgr loc =
   Net.Channel.listen mgr (`TCPv4 (loc, (control_channel st ))) <&>
-  (forward_thread st) <&>
-    (Ofswitch_config.listen_t mgr (add_port mgr st) 
-    (del_port mgr st) (get_flow_stats st) (add_flow st) (del_flow st) 6634) 
+  (forward_thread st)
 
 let connect st mgr loc  =
   Net.Channel.connect mgr (`TCPv4 (None, loc, (control_channel st loc))) <&> 
-  (forward_thread st) <&>
-    (Ofswitch_config.listen_t mgr (add_port mgr st) (del_port mgr st) (get_flow_stats st) 
-     (add_flow st) (del_flow st) 6634) 
+  (forward_thread st)
 
 let local_connect st mgr conn =
   let _ = st.Switch.controller <- (Some conn) in 
      (control_channel_run st conn) <&> 
-  (forward_thread st)  <&>
-    (Ofswitch_config.listen_t mgr (add_port mgr st) (del_port mgr st) (get_flow_stats st) 
-     (add_flow st) (del_flow st) 6634) 
+     (forward_thread st) 
 
 let standalone_connect st mgr loc  =
   let of_ctrl = Ofswitch_standalone.init_controller () in 
-  let _ = Lwt.ignore_result (Ofswitch_config.listen_t mgr (add_port mgr st) (del_port mgr st) 
-            (get_flow_stats st)  (add_flow st) (del_flow st) 6634) in 
-  let _ = ignore_result (forward_thread st) in 
+  (* let _ = ignore_result (forward_thread st) in *)
   let _ = cp "[switch] Listening socket...\n%!" in 
     while_lwt true do
       let t,u = Lwt.task () in 
@@ -1085,7 +1115,6 @@ let standalone_connect st mgr loc  =
       let rec connect_socket () =
         let sock = ref None in 
         try_lwt
-          let _ = Printf.printf "trying to connect to controller\n%!" in 
           lwt _ = Lwt.pick
             [(Net.Channel.connect mgr (`TCPv4(None,loc,(fun t -> return (sock:=Some(t))))));
              (OS.Time.sleep 10.0)]

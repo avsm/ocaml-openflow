@@ -20,6 +20,7 @@ open Net
 module Event : sig
     open Ofpacket
 
+    (** Event messages *)
     type t =
         DATAPATH_JOIN
       | DATAPATH_LEAVE
@@ -33,26 +34,51 @@ module Event : sig
       | PORT_STATUS_CHANGE
 
     type e =
-        Datapath_join of datapath_id
+        Datapath_join of datapath_id * Ofpacket.Port.phy list
       | Datapath_leave of datapath_id
-      | Packet_in of Port.t * int32 * Cstruct.buf * datapath_id
+      | Packet_in of Port.t * Packet_in.reason * int32 * 
+                      Cstruct.t * datapath_id
       | Flow_removed of Match.t * Flow_removed.reason * 
           int32 * int32 * int64 * int64 * datapath_id
       | Flow_stats_reply of int32 * bool * Flow.stats list * datapath_id
       | Aggr_flow_stats_reply of int32 * int64 * int64 * int32 * datapath_id
-      | Port_stats_reply of int32 * Port.stats list * datapath_id
-      | Table_stats_reply of int32 * Stats.table list * datapath_id
+      | Port_stats_reply of int32 * bool * Port.stats list * datapath_id
+      | Table_stats_reply of int32 * bool * Stats.table list * datapath_id
       | Desc_stats_reply of string * string * string * string * string * datapath_id
       | Port_status of Port.reason * Port.phy * datapath_id
+
+      (** convert a controller event to a string representation *)
     val string_of_event : e -> string
   end
 
-type t 
+type t
+
+(** [register_cb ctrl evt fn] registers a callback for a specific event on
+ * controller ctrl *)
 val register_cb : t -> Event.t -> (t -> Ofpacket.datapath_id -> Event.e -> unit  Lwt.t) -> unit
-val send_of_data : t -> Ofpacket.datapath_id -> Cstruct.buf  -> unit Lwt.t
-val terminate : t -> unit
-val mem_dbg : string -> unit
-val listen : Manager.t -> Nettypes.ipv4_src -> 
+
+(** Controll channel packet transmission *)
+
+(** [send_of_data ctrl dpid bits] send a byte packet to the switch with datapath
+ * dpid throught the ctrl controller *)
+val send_of_data : t -> Ofpacket.datapath_id -> Cstruct.t  -> unit Lwt.t
+(** [send_data ctrl dpid pkt] send the pkt OpenFlow message to the switch with datapath
+ * dpid throught the ctrl controller *)
+val send_data : t -> Ofpacket.datapath_id -> Ofpacket.t  -> unit Lwt.t
+
+(** Controller daemon setup *)
+
+(** [init_controller init] create the state for an openflow controller and
+ * initialize it using the init method *)
+val init_controller : ?verbose:bool -> (t -> 'a) -> t 
+(** [listen mgr addr init] listen on addr for connection switches. Intialize the
+ * state for each control channel unsing the init method. *)
+val listen : Manager.t -> ?verbose:bool -> Nettypes.ipv4_src -> 
   (t -> 'a) -> unit Lwt.t
-val connect : Manager.t -> Nettypes.ipv4_dst -> 
+(** [connect mgr addr init] connect to the switch  on addr. Intialize the
+ * state of the control channel unsing the init method. *)
+val connect : Manager.t -> ?verbose:bool -> Nettypes.ipv4_dst -> 
   (t -> 'a) -> unit Lwt.t
+  (** [local_connect ctrl conn] connect to the switch  using a local OpenFlow
+   * socket. *)
+val local_connect : t -> Ofsocket.conn_state -> unit Lwt.t
